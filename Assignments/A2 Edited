@@ -1,0 +1,176 @@
+"""
+Code Division Multiplexing (CDM / CDMA)
+=======================================
+Requirement (1): Implement CDM in Python.
+  -> Entire module implements CDM encode (superposition) and decode (correlation).
+
+Requirement (2): Input should be the chip sequences and the transmissions.
+  -> Functions `run_cdm`, `encode`, and `decode` accept these as arguments.
+
+Requirement (3): Output should be recovery of each station's signal.
+  -> `decode` returns per-station recovered bits; `run_cdm` returns `(received, recovered)`.
+     The sample section prints the recovered bits clearly.
+
+Requirement (4): Use the chip sequences from the example from slide/book.
+  -> Chip set for A–D (length 8) from the textbook/slide is included in `__main__`.
+
+Requirement (5): Print the sample input-output of that example at the end of your code.
+  -> `print_sample(...)` is called in `__main__` to print chip sequences, transmissions,
+     combined received chips, and recovered bits. Assertions verify the known output.
+
+Conventions:
+- Bit "1" is sent as  +1 * chip sequence
+- Bit "0" is sent as  -1 * chip sequence
+- Silent user = omitted or value None (no contribution)
+
+Public API:
+- run_cdm(chips: Dict[str, List[int]], transmissions: Dict[str, Optional[int]], threshold: float=0.5)
+    -> Tuple[List[int], Dict[str, Optional[int]]]
+"""
+
+# ---------------- Requirement (1): Implement CDM in Python ----------------
+# (The following imports, types, helpers, encode/decode, and runner implement CDM.)
+
+from typing import Dict, List, Optional, Tuple
+
+# ---------------- Requirement (2): Inputs are chip sequences & transmissions ----------------
+# Types documented for clarity (stations map to ±1 chip sequences; transmissions map to bits or None).
+ChipSeq = List[int]
+ChipsDict = Dict[str, ChipSeq]
+TxDict = Dict[str, Optional[int]]
+
+# ---------------- Core math helpers (used by CDM) ----------------
+def dot(a: List[int], b: List[int]) -> int:
+    return sum(x*y for x, y in zip(a, b))
+
+def add_vec(a: List[int], b: List[int]) -> List[int]:
+    if len(a) != len(b):
+        raise ValueError("Vector length mismatch.")
+    return [x+y for x, y in zip(a, b)]
+
+def scale_vec(s: int, v: List[int]) -> List[int]:
+    return [s*x for x in v]
+
+# ---------------- Defensive validation (orthogonality & correctness) ----------------
+def check_orthogonality(chips: ChipsDict) -> None:
+    """
+    Requirement (1) detail: Proper CDM needs orthogonal codes.
+    This ensures same length, ±1 values, and pairwise orthogonality.
+    """
+    if not chips:
+        raise ValueError("No chip sequences provided.")
+    names = list(chips.keys())
+    L = len(chips[names[0]])
+    for n in names:
+        seq = chips[n]
+        if len(seq) != L:
+            raise ValueError("All chip sequences must have the same length.")
+        if any(x not in (-1, 1) for x in seq):
+            raise ValueError(f"Chip sequence '{n}' must contain only ±1 values.")
+    for i in range(len(names)):
+        for j in range(i, len(names)):
+            ni, nj = names[i], names[j]
+            d = dot(chips[ni], chips[nj])
+            if i == j and d != L:
+                raise ValueError(f"Sequence {ni} must satisfy dot(seq, seq) == {L}, got {d}.")
+            if i != j and d != 0:
+                raise ValueError(f"Sequences {ni} and {nj} are not orthogonal (dot={d}).")
+
+# ---------------- Requirement (1): CDM Encoding (superposition) ----------------
+def encode(chips: ChipsDict, transmissions: TxDict) -> List[int]:
+    """
+    Requirement (2): Input = chip sequences + transmissions.
+    Requirement (1): CDM superposition.
+    Mapping:
+      bit 1 -> +1 * chip
+      bit 0 -> -1 * chip
+      None/omitted -> no contribution
+    Returns the combined received chip vector.
+    """
+    names = list(chips.keys())
+    L = len(chips[names[0]])
+    y = [0] * L
+    for name, seq in chips.items():
+        b = transmissions.get(name, None)
+        if b is None:
+            continue  # silent station
+        if b not in (0, 1):
+            raise ValueError(f"Invalid bit for '{name}': expected 0, 1, or None.")
+        symbol = +1 if b == 1 else -1
+        y = add_vec(y, scale_vec(symbol, seq))
+    return y
+
+# ---------------- Requirement (3): CDM Decoding (recovery of each station's signal) ----------------
+def decode(received: List[int], chips: ChipsDict, threshold: float = 0.5) -> Dict[str, Optional[int]]:
+    """
+    Requirement (3): Output = recovery per station via normalized correlation:
+      score = (received · chip) / L  ≈ +1 (bit=1), -1 (bit=0), 0 (silent)
+    threshold determines silent/undecided range (-thr .. +thr).
+    """
+    L = len(received)
+    out: Dict[str, Optional[int]] = {}
+    for name, seq in chips.items():
+        if len(seq) != L:
+            raise ValueError(f"Length mismatch between received vector and chip '{name}'.")
+        score = dot(received, seq) / L
+        if score > threshold:
+            out[name] = 1
+        elif score < -threshold:
+            out[name] = 0
+        else:
+            out[name] = None
+    return out
+
+# ---------------- Requirement (1,2,3): End-to-end wrapper (validate, encode, decode) ----------------
+def run_cdm(chips: ChipsDict, transmissions: TxDict, threshold: float = 0.5) -> Tuple[List[int], Dict[str, Optional[int]]]:
+    """
+    Requirement (2): takes chip sequences and transmissions as inputs.
+    Requirement (1): performs CDM (orthogonality check + superposition + correlation).
+    Requirement (3): returns recovery per station.
+    """
+    check_orthogonality(chips)
+    received = encode(chips, transmissions)
+    recovered = decode(received, chips, threshold=threshold)
+    return received, recovered
+
+# ---------------- Pretty-print helpers for Requirement (5) ----------------
+def pretty_vec(v: List[int]) -> str:
+    return "[" + " ".join(f"{x:+d}" for x in v) + "]"
+
+def print_sample(chips: ChipsDict, transmissions: TxDict, received: List[int], recovered: Dict[str, Optional[int]]):
+    """
+    Requirement (5): Print the sample input-output of the book/slide example.
+    """
+    print("=== CDM Demo (Tanenbaum example) ===")
+    print("Chip length:", len(next(iter(chips.values()))))
+    print("Chip sequences:")
+    for name in sorted(chips):
+        print(f"  {name}: {chips[name]}")
+    print("\nSample transmissions (input):")
+    for name in sorted(chips):
+        print(f"  {name}: {transmissions.get(name, None)}")
+    print("\nCombined received chips (output of channel):")
+    print(" ", pretty_vec(received))
+    print("\nRecovered bits per station (decoder output):")
+    for name in sorted(chips):
+        print(f"  {name}: {recovered[name]}")
+
+# ---------------- Requirement (4) & (5): Use book chip set + print sample at end ----------------
+if __name__ == "__main__":
+    # Requirement (4): Chip sequences of the stations from the example from slide/book (length 8).
+    # Tanenbaum Fig. 2-28(a) — A, B, C, D
+    chips: ChipsDict = {
+        "A": [-1, -1, -1, +1, +1, -1, +1, +1],
+        "B": [-1, -1, +1, -1, +1, +1, +1, -1],
+        "C": [-1, +1, -1, +1, +1, +1, -1, -1],
+        "D": [-1, +1, -1, -1, -1, -1, +1, -1],
+    }
+
+    # Requirement (2): Input transmissions (A=1, B=1, C=1, D=1).
+    transmissions: TxDict = {"A": 1, "B": 1, "C": 1, "D": 1} 
+
+    # Run CDM: Requirement (1,2,3)
+    received, recovered = run_cdm(chips, transmissions, threshold=0.5)
+
+    # Requirement (5): Print the sample input-output at the end of the code.
+    print_sample(chips, transmissions, received, recovered)
