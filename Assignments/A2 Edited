@@ -174,3 +174,9 @@ if __name__ == "__main__":
 
     # Requirement (5): Print the sample input-output at the end of the code.
     print_sample(chips, transmissions, received, recovered)
+
+  # --- Example 2: Mixed case (custom second example) ---
+    # A sends 1, B sends 0, C silent, D sends 1
+    transmissions2: TxDict = {"A": 1, "B": 0, "D": 1}
+    received2, recovered2 = run_cdm(chips, transmissions2)
+    print_sample(chips, transmissions2, received2, recovered2)
