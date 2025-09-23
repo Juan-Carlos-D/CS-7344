@@ -1,369 +1,15 @@
-# selective_repeat_sim.py
+# selective_repeat_sim.py  (summary tables + safe dup-ACK + NACK override)
 # ----------------------------------------------------------
-# Implements Selective Repeat ARQ Protocol in Python
-# Input: frames (>=7)
-# Output: status log of DATA/ACK/NACK (sent/received/lost/corrupted),
-#         plus final delivery order
-# Error Control: CRC-16 error detection + ARQ retransmission (timeouts, NACKs)
-# This fully addresses the assignment requirements.
+# Implements Selective Repeat ARQ in Python.
+# Adds compact summary tables for DATA and control (ACK/NACK) PDUs.
+# FIXES:
+#  - Duplicate ACKs are sent ONLY for out-of-window frames that were already delivered.
+#  - Sender honors NACKs even if the seq isn't currently "unacked" (to break deadlocks).
 # ----------------------------------------------------------
 
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
-import random, itertools
-
-# ----------------------------
-# PDUs and CRC-16/CCITT-FALSE
-# ----------------------------
-@dataclass
-class PDU:
-    # Each protocol data unit (DATA/ACK/NACK) used in Selective Repeat
-    kind: str                 # 'DATA', 'ACK', or 'NACK'
-    seq: Optional[int]        # Sequence number (or ACK/NACK target)
-    payload: bytes = b''      # Data payload (bytes)
-    crc: int = 0              # CRC-16 checksum for error detection
-    sent_at: Optional[int] = None
-    id: int = field(default_factory=itertools.count().__next__)
-
-def crc16_ccitt(data: bytes, poly=0x1021, init=0xFFFF) -> int:
-    """
-    Implements CRC-16/CCITT-FALSE error detection.
-    Requirement: Error detection algorithm included as part of error control.
-    """
-    crc = init
-    for b in data:
-        crc ^= b << 8
-        for _ in range(8):
-            if crc & 0x8000:
-                crc = ((crc << 1) & 0xFFFF) ^ poly
-            else:
-                crc = (crc << 1) & 0xFFFF
-    return crc
-
-def build_pdu(kind: str, seq: Optional[int], payload: bytes=b'') -> PDU:
-    """
-    Constructs a PDU and attaches CRC checksum.
-    - Used for DATA, ACK, and NACK.
-    """
-    header = f"{kind}:{seq if seq is not None else -1}:".encode()
-    return PDU(kind=kind, seq=seq, payload=payload, crc=crc16_ccitt(header + payload))
-
-# ----------------------------
-# Unreliable Channel
-# ----------------------------
-class Channel:
-    """
-    Models an unreliable channel:
-    - Random frame loss
-    - Random bit errors (corruption)
-    Requirement: Output must include sent/received/lost/corrupted statuses.
-    """
-    def __init__(self, p_loss=0.10, p_bit_error=0.02, seed=42, rtt=4):
-        self.p_loss = p_loss
-        self.p_bit_error = p_bit_error
-        self.random = random.Random(seed)
-        self.rtt = rtt
-
-    def transmit(self, pdu: PDU, now: int, log: List[str]) -> Optional[Tuple[int, PDU]]:
-        # Simulate frame loss
-        if self.random.random() < self.p_loss:
-            log.append(f"[t={now}] {pdu.kind}[{pdu.seq}] **lost** on channel")
-            return None
-
-        # Simulate random bit corruption (error detection via CRC later)
-        corrupted = False
-        raw = bytearray(pdu.payload)
-        for i in range(len(raw)):
-            if self.random.random() < self.p_bit_error:
-                raw[i] ^= 1 << self.random.randrange(8)
-                corrupted = True
-
-        recv = PDU(kind=pdu.kind, seq=pdu.seq, payload=bytes(raw), crc=pdu.crc)
-        delay = self.rtt // 2 + self.random.randint(0, 2)
-        arrival = now + delay
-        log.append(f"[t={now}] {pdu.kind}[{pdu.seq}] sent -> arrives {'corrupted' if corrupted else 'ok'} at t={arrival}")
-        return arrival, recv
-
-# ----------------------------
-# Selective Repeat ARQ Protocol
-# ----------------------------
-class SelectiveRepeatSimulator:
-    """
-    Implements full Selective Repeat ARQ:
-    - Sliding window protocol (requirement)
-    - Per-sequence ACKs (not cumulative like Go-Back-N)
-    - Buffers out-of-order frames
-    - Uses CRC error detection + retransmissions (timeout + NACK)
-    - Logs every event (sent/received/lost/corrupted) for DATA/ACK/NACK
-    """
-    def __init__(
-        self,
-        frames: List[bytes],   # >=7 frames required (assignment requirement)
-        k_bits=3,
-        window_size=None,   # W <= N/2
-        timeout=12,
-        p_loss=0.10,
-        p_bit_error=0.02,
-        seed=7,
-        rtt=4
-    ):
-        assert len(frames) >= 7, "Provide at least 7 frames."  # requirement
-        self.N = 1 << k_bits
-        self.W = window_size if window_size is not None else self.N // 2
-        assert self.W <= self.N // 2, "Selective Repeat requires W <= N/2."
-
-        self.frames = frames
-        self.timeout = timeout
-        self.channel = Channel(p_loss=p_loss, p_bit_error=p_bit_error, seed=seed, rtt=rtt)
-
-        # Simulation state
-        self.now = 0
-        self.log: List[str] = []          # Status log (requirement: full trace)
-        self.inflight: List[Tuple[int, PDU, bool]] = []  # channel events
-
-        # Sender state
-        self.send_index = 0
-        self.unacked: Dict[int, Tuple[PDU, int, int]] = {}  # outstanding frames
-
-        # Receiver state
-        self.recv_expected = 0
-        self.recv_buffer: Dict[int, PDU] = {}
-        self.delivered: List[bytes] = []
-        self.nacked_once: set[int] = set()
-
-    # Helper: circular window membership
-    def _in_window(self, seq: int, base: int, W: int) -> bool:
-        end = (base + W - 1) % self.N
-        if base <= end:
-            return base <= seq <= end
-        return seq >= base or seq <= end
-
-    # ---------- Simulation tick ----------
-    def tick(self):
-        """
-        Advances simulation by 1 tick:
-        - Sender transmits new frames within window
-        - Channel delivers arrivals
-        - Timeouts checked
-        - Logging at every step
-        """
-        # Sender pushes new data frames if window not full
-        while self.send_index < len(self.frames) and len(self.unacked) < self.W:
-            seq = self.send_index % self.N
-            pdu = build_pdu('DATA', seq, self.frames[self.send_index])
-            pdu.sent_at = self.now
-            self.unacked[seq] = (pdu, self.now, self.send_index)
-            self.send_index += 1
-            r = self.channel.transmit(pdu, self.now, self.log)
-            if r:
-                self.inflight.append((r[0], r[1], False))
-
-        # Deliver arrivals scheduled for this tick
-        arrivals = [e for e in self.inflight if e[0] == self.now]
-        self.inflight = [e for e in self.inflight if e[0] != self.now]
-        for _, pdu, to_sender in arrivals:
-            if to_sender:
-                self._handle_at_sender(pdu)
-            else:
-                self._handle_at_receiver(pdu)
-
-        # Timeout check: retransmit if exceeded
-        for seq, (pdu, tsent, idx) in list(self.unacked.items()):
-            if self.now - tsent >= self.timeout:
-                self.log.append(f"[t={self.now}] TIMEOUT data[{seq}] -> retransmit")
-                self.unacked[seq] = (pdu, self.now, idx)
-                r = self.channel.transmit(pdu, self.now, self.log)
-                if r:
-                    self.inflight.append((r[0], r[1], False))
-
-        self.now += 1
-
-    # ---------- Receiver logic ----------
-    def _handle_at_receiver(self, pdu: PDU):
-        """
-        Receiver side of Selective Repeat:
-        - CRC check for error detection
-        - Accepts DATA within window, buffers, ACKs
-        - Delivers in-order data to application
-        - Sends NACK for missing frames (error recovery)
-        """
-        header = f"{pdu.kind}:{pdu.seq if pdu.seq is not None else -1}:".encode()
-        ok = (crc16_ccitt(header + pdu.payload) == pdu.crc)
-        if not ok:
-            self.log.append(f"[t={self.now}] Receiver: {pdu.kind}[{pdu.seq}] **corrupted** -> drop")
-            if pdu.kind == 'DATA' and self.recv_expected not in self.nacked_once:
-                nack = build_pdu('NACK', self.recv_expected)
-                r = self.channel.transmit(nack, self.now, self.log)
-                if r: self.inflight.append((r[0], r[1], True))
-                self.nacked_once.add(self.recv_expected)
-            return
-
-        self.log.append(f"[t={self.now}] Receiver: {pdu.kind}[{pdu.seq}] received ok")
-        if pdu.kind != 'DATA':
-            return
-
-        seq = pdu.seq
-        if self._in_window(seq, self.recv_expected, self.W):
-            # Buffer accepted frame
-            if seq not in self.recv_buffer:
-                self.recv_buffer[seq] = pdu
-
-            # Send ACK
-            ack = build_pdu('ACK', seq)
-            r = self.channel.transmit(ack, self.now, self.log)
-            if r: self.inflight.append((r[0], r[1], True))
-
-            # Deliver in-order to application
-            while self.recv_expected in self.recv_buffer:
-                dpdu = self.recv_buffer.pop(self.recv_expected)
-                self.delivered.append(dpdu.payload)
-                self.log.append(f"[t={self.now}] Receiver: **DELIVER** data[{self.recv_expected}] to app")
-                self.recv_expected = (self.recv_expected + 1) % self.N
-                self.nacked_once.discard(self.recv_expected)
-
-            # Send NACK for missing frame (once)
-            if (self.recv_expected not in self.recv_buffer
-                and any(s != self.recv_expected for s in self.recv_buffer)
-                and self.recv_expected not in self.nacked_once):
-                nack = build_pdu('NACK', self.recv_expected)
-                r = self.channel.transmit(nack, self.now, self.log)
-                if r: self.inflight.append((r[0], r[1], True))
-                self.nacked_once.add(self.recv_expected)
-
-        else:
-            # Out-of-window DATA ignored; send NACK for base
-            self.log.append(f"[t={self.now}] Receiver: DATA[{seq}] **out-of-window** (base={self.recv_expected}, W={self.W}) -> drop")
-            if self.recv_expected not in self.nacked_once:
-                nack = build_pdu('NACK', self.recv_expected)
-                r = self.channel.transmit(nack, self.now, self.log)
-                if r: self.inflight.append((r[0], r[1], True))
-                self.nacked_once.add(self.recv_expected)
-
-    # ---------- Sender logic ----------
-    def _handle_at_sender(self, pdu: PDU):
-        """
-        Sender side of Selective Repeat:
-        - Validates ACK/NACK with CRC
-        - ACK clears outstanding frame
-        - NACK triggers fast retransmission
-        """
-        header = f"{pdu.kind}:{pdu.seq if pdu.seq is not None else -1}:".encode()
-        ok = (crc16_ccitt(header + pdu.payload) == pdu.crc)
-        if not ok:
-            self.log.append(f"[t={self.now}] Sender: {pdu.kind}[{pdu.seq}] **corrupted** -> drop")
-            return
-
-        self.log.append(f"[t={self.now}] Sender: {pdu.kind}[{pdu.seq}] received ok")
-
-        if pdu.kind == 'ACK':
-            if pdu.seq in self.unacked:
-                del self.unacked[pdu.seq]
-                self.log.append(f"[t={self.now}] Sender: ACKed data[{pdu.seq}]")
-        elif pdu.kind == 'NACK':
-            if pdu.seq in self.unacked:
-                data_pdu, _, idx = self.unacked[pdu.seq]
-                self.log.append(f"[t={self.now}] Sender: NACK for data[{pdu.seq}] -> fast retransmit")
-                self.unacked[pdu.seq] = (data_pdu, self.now, idx)
-                r = self.channel.transmit(data_pdu, self.now, self.log)
-                if r: self.inflight.append((r[0], r[1], False))
-
-    # ---------- Termination ----------
-    def done(self):
-        """
-        Simulation ends when:
-        - All frames delivered
-        - No unacked or inflight PDUs
-        Requirement: protocol runs until complete.
-        """
-        return (
-            len(self.delivered) == len(self.frames)
-            and not self.unacked
-            and not self.inflight
-            and self.send_index >= len(self.frames)
-        )
-
-    def run(self, max_ticks=1000):
-        """
-        Run simulation until done or stall detected.
-        Requirement: produce full log of events and final delivery order.
-        """
-        STALL_LIMIT = 300
-        stagnant = 0
-
-        def snap():
-            return (len(self.delivered), len(self.unacked), len(self.inflight), self.send_index, self.recv_expected)
-
-        before = snap()
-        while not self.done() and self.now < max_ticks:
-            self.tick()
-            after = snap()
-            stagnant = stagnant + 1 if after == before else 0
-            if stagnant >= STALL_LIMIT:
-                self.log.append(f"[t={self.now}] **STALL** detected (no progress for {STALL_LIMIT} ticks) — stopping.")
-                break
-            before = after
-
-        finished = "YES" if self.done() else "NO"
-        self.log.append(f"[t={self.now}] Simulation finished={finished}, delivered={len(self.delivered)}/{len(self.frames)}")
-        return "\n".join(self.log), [p.decode(errors='ignore') for p in self.delivered], self.now
-
-# ----------------------------
-# Example usage
-# ----------------------------
-if __name__ == "__main__":
-    # Requirement: input at least 7 frames
-    frames = [f"Frame {i}".encode() for i in range(8)]
-
-    sim = SelectiveRepeatSimulator(
-        frames=frames,
-        k_bits=3,       # Sequence number space (N=8)
-        window_size=4,  # Window size W <= N/2
-        timeout=12,     # Timeout for retransmission
-        p_loss=0.12,    # Channel loss probability
-        p_bit_error=0.02, # Bit error probability
-        seed=9,
-        rtt=4
-    )
-
-    status_log, delivered_order, ticks = sim.run(max_ticks=1000)
-
-    print("---- STATUS LOG ----")
-    print(status_log)
-    print("\n---- DELIVERY ORDER ----")
-    print(delivered_order)
-    print(f"\nCompleted in {ticks} ticks, delivered {len(delivered_order)} frames.")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-###############################################################################################################################################################3
-
-
-
-# selective_repeat_sim.py  (final conservative RX: never ACK out-of-window)
-from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Tuple
+from collections import defaultdict
 import random, itertools
 
 # ----------------------------
@@ -372,7 +18,7 @@ import random, itertools
 @dataclass
 class PDU:
     kind: str                 # 'DATA', 'ACK', 'NACK'
-    seq: Optional[int]        # DATA seq or ACK/NACK target seq
+    seq: Optional[int]
     payload: bytes = b''
     crc: int = 0
     sent_at: Optional[int] = None
@@ -390,25 +36,47 @@ def crc16_ccitt(data: bytes, poly=0x1021, init=0xFFFF) -> int:
     return crc
 
 def build_pdu(kind: str, seq: Optional[int], payload: bytes=b'') -> PDU:
+    # Control frames get a 1-byte payload so bit flips can corrupt them.
+    if kind in ('ACK', 'NACK') and payload == b'':
+        payload = b'\x00'
     header = f"{kind}:{seq if seq is not None else -1}:".encode()
     return PDU(kind=kind, seq=seq, payload=payload, crc=crc16_ccitt(header + payload))
+
+# ----------------------------
+# Simple stats recorder
+# ----------------------------
+def _default_data_stats():
+    return {
+        'sent': 0, 'retransmits': 0, 'lost': 0, 'corrupted': 0,
+        'acked': 0, 'delivered': 0, 'timeouts': 0
+    }
+
+def _default_ctrl_stats():
+    return {
+        'sent': 0, 'lost': 0, 'corrupted': 0,
+        'rx_ok_sender': 0, 'rx_ok_receiver': 0
+    }
 
 # ----------------------------
 # Unreliable Channel
 # ----------------------------
 class Channel:
-    def __init__(self, p_loss=0.10, p_bit_error=0.02, seed=42, rtt=4):
+    def __init__(self, p_loss=0.10, p_bit_error=0.02, seed=42, rtt=4, stats=None):
         self.p_loss = p_loss
         self.p_bit_error = p_bit_error
         self.random = random.Random(seed)
         self.rtt = rtt
+        self.stats = stats
 
     def transmit(self, pdu: PDU, now: int, log: List[str]) -> Optional[Tuple[int, PDU]]:
+        # Loss
         if self.random.random() < self.p_loss:
             log.append(f"[t={now}] {pdu.kind}[{pdu.seq}] **lost** on channel")
+            if self.stats is not None:
+                self._inc_loss(pdu)
             return None
 
-        # Corrupt only the payload bytes we “see” at the other end (seq/kind unchanged)
+        # Bit flips on payload
         corrupted = False
         raw = bytearray(pdu.payload)
         for i in range(len(raw)):
@@ -420,7 +88,23 @@ class Channel:
         delay = self.rtt // 2 + self.random.randint(0, 2)
         arrival = now + delay
         log.append(f"[t={now}] {pdu.kind}[{pdu.seq}] sent -> arrives {'corrupted' if corrupted else 'ok'} at t={arrival}")
+
+        if self.stats is not None and corrupted:
+            self._inc_corrupt(pdu)
+
         return arrival, recv
+
+    def _inc_loss(self, pdu: PDU):
+        if pdu.kind == 'DATA':
+            self.stats['DATA'][pdu.seq]['lost'] += 1
+        else:
+            self.stats[pdu.kind][pdu.seq]['lost'] += 1
+
+    def _inc_corrupt(self, pdu: PDU):
+        if pdu.kind == 'DATA':
+            self.stats['DATA'][pdu.seq]['corrupted'] += 1
+        else:
+            self.stats[pdu.kind][pdu.seq]['corrupted'] += 1
 
 # ----------------------------
 # Selective Repeat ARQ
@@ -430,7 +114,7 @@ class SelectiveRepeatSimulator:
         self,
         frames: List[bytes],
         k_bits=3,
-        window_size=None,   # default W = N/2
+        window_size=None,
         timeout=12,
         p_loss=0.10,
         p_bit_error=0.02,
@@ -444,11 +128,19 @@ class SelectiveRepeatSimulator:
 
         self.frames = frames
         self.timeout = timeout
-        self.channel = Channel(p_loss=p_loss, p_bit_error=p_bit_error, seed=seed, rtt=rtt)
+
+        # Stats
+        self.stats = {
+            'DATA': defaultdict(_default_data_stats),
+            'ACK': defaultdict(_default_ctrl_stats),
+            'NACK': defaultdict(_default_ctrl_stats),
+        }
+
+        self.channel = Channel(p_loss=p_loss, p_bit_error=p_bit_error, seed=seed, rtt=rtt, stats=self.stats)
 
         self.now = 0
         self.log: List[str] = []
-        self.inflight: List[Tuple[int, PDU, bool]] = []  # (arrival_time, pdu, to_sender?)
+        self.inflight: List[Tuple[int, PDU, bool]] = []
 
         # sender
         self.send_index = 0
@@ -458,9 +150,10 @@ class SelectiveRepeatSimulator:
         self.recv_expected = 0
         self.recv_buffer: Dict[int, PDU] = {}
         self.delivered: List[bytes] = []
-        self.nacked_once: set[int] = set()  # remember which expected seq we already NACKed
+        self.delivered_set: set[int] = set()   # <-- track which seqs are truly delivered
+        self.nacked_once: set[int] = set()
 
-    # inclusive circular membership
+    # Inclusive circular membership for size W window starting at base
     def _in_window(self, seq: int, base: int, W: int) -> bool:
         end = (base + W - 1) % self.N
         if base <= end:
@@ -469,13 +162,14 @@ class SelectiveRepeatSimulator:
 
     # ---------- main tick ----------
     def tick(self):
-        # sender: push new data while window has space
+        # sender: push new DATA while window has space
         while self.send_index < len(self.frames) and len(self.unacked) < self.W:
             seq = self.send_index % self.N
             pdu = build_pdu('DATA', seq, self.frames[self.send_index])
             pdu.sent_at = self.now
             self.unacked[seq] = (pdu, self.now, self.send_index)
             self.send_index += 1
+            self.stats['DATA'][seq]['sent'] += 1
             r = self.channel.transmit(pdu, self.now, self.log)
             if r:
                 self.inflight.append((r[0], r[1], False))
@@ -493,7 +187,10 @@ class SelectiveRepeatSimulator:
         for seq, (pdu, tsent, idx) in list(self.unacked.items()):
             if self.now - tsent >= self.timeout:
                 self.log.append(f"[t={self.now}] TIMEOUT data[{seq}] -> retransmit")
+                self.stats['DATA'][seq]['timeouts'] += 1
+                self.stats['DATA'][seq]['retransmits'] += 1
                 self.unacked[seq] = (pdu, self.now, idx)
+                self.stats['DATA'][seq]['sent'] += 1
                 r = self.channel.transmit(pdu, self.now, self.log)
                 if r:
                     self.inflight.append((r[0], r[1], False))
@@ -502,29 +199,31 @@ class SelectiveRepeatSimulator:
 
     # ---------- receiver ----------
     def _handle_at_receiver(self, pdu: PDU):
-        # CRC check against original header+payload
         header = f"{pdu.kind}:{pdu.seq if pdu.seq is not None else -1}:".encode()
         ok = (crc16_ccitt(header + pdu.payload) == pdu.crc)
         if not ok:
             self.log.append(f"[t={self.now}] Receiver: {pdu.kind}[{pdu.seq}] **corrupted** -> drop")
             if pdu.kind == 'DATA' and self.recv_expected not in self.nacked_once:
                 nack = build_pdu('NACK', self.recv_expected)
+                self.stats['NACK'][self.recv_expected]['sent'] += 1
                 r = self.channel.transmit(nack, self.now, self.log)
                 if r: self.inflight.append((r[0], r[1], True))
                 self.nacked_once.add(self.recv_expected)
             return
 
         self.log.append(f"[t={self.now}] Receiver: {pdu.kind}[{pdu.seq}] received ok")
-        if pdu.kind != 'DATA':
-            return
+        if pdu.kind in ('ACK', 'NACK'):
+            return  # receiver doesn't consume control PDUs in this model
 
+        # DATA handling
         seq = pdu.seq
-        # Case A: in-window -> buffer + ACK
         if self._in_window(seq, self.recv_expected, self.W):
             if seq not in self.recv_buffer:
                 self.recv_buffer[seq] = pdu
 
+            # ACK back
             ack = build_pdu('ACK', seq)
+            self.stats['ACK'][seq]['sent'] += 1
             r = self.channel.transmit(ack, self.now, self.log)
             if r: self.inflight.append((r[0], r[1], True))
 
@@ -532,28 +231,40 @@ class SelectiveRepeatSimulator:
             while self.recv_expected in self.recv_buffer:
                 dpdu = self.recv_buffer.pop(self.recv_expected)
                 self.delivered.append(dpdu.payload)
+                self.delivered_set.add(self.recv_expected)   # <-- mark truly delivered
+                self.stats['DATA'][self.recv_expected]['delivered'] += 1
                 self.log.append(f"[t={self.now}] Receiver: **DELIVER** data[{self.recv_expected}] to app")
                 self.recv_expected = (self.recv_expected + 1) % self.N
-                # new hole -> allow a new NACK if needed
                 self.nacked_once.discard(self.recv_expected)
 
-            # gap? NACK once
+            # gap? single NACK for base
             if (self.recv_expected not in self.recv_buffer
                 and any(s != self.recv_expected for s in self.recv_buffer)
                 and self.recv_expected not in self.nacked_once):
                 nack = build_pdu('NACK', self.recv_expected)
+                self.stats['NACK'][self.recv_expected]['sent'] += 1
                 r = self.channel.transmit(nack, self.now, self.log)
                 if r: self.inflight.append((r[0], r[1], True))
                 self.nacked_once.add(self.recv_expected)
 
-        # Case B: out-of-window -> DO NOT ACK; NACK base once and drop
         else:
+            # Out-of-window: only ACK if we've ALREADY delivered that seq (true left-dup).
             self.log.append(f"[t={self.now}] Receiver: DATA[{seq}] **out-of-window** (base={self.recv_expected}, W={self.W}) -> drop")
-            if self.recv_expected not in self.nacked_once:
-                nack = build_pdu('NACK', self.recv_expected)
-                r = self.channel.transmit(nack, self.now, self.log)
+
+            if seq in self.delivered_set:
+                # Safe duplicate ACK: helps sender converge if previous ACK was lost.
+                ack = build_pdu('ACK', seq)
+                self.stats['ACK'][seq]['sent'] += 1
+                r = self.channel.transmit(ack, self.now, self.log)
                 if r: self.inflight.append((r[0], r[1], True))
-                self.nacked_once.add(self.recv_expected)
+            else:
+                # Not yet delivered (right side) — do NOT ACK; just hint the hole once.
+                if self.recv_expected not in self.nacked_once:
+                    nack = build_pdu('NACK', self.recv_expected)
+                    self.stats['NACK'][self.recv_expected]['sent'] += 1
+                    r = self.channel.transmit(nack, self.now, self.log)
+                    if r: self.inflight.append((r[0], r[1], True))
+                    self.nacked_once.add(self.recv_expected)
 
     # ---------- sender ----------
     def _handle_at_sender(self, pdu: PDU):
@@ -565,21 +276,38 @@ class SelectiveRepeatSimulator:
 
         self.log.append(f"[t={self.now}] Sender: {pdu.kind}[{pdu.seq}] received ok")
 
+        if pdu.kind in ('ACK', 'NACK'):
+            self.stats[pdu.kind][pdu.seq]['rx_ok_sender'] += 1
+
         if pdu.kind == 'ACK':
-            # only clear if still outstanding
             if pdu.seq in self.unacked:
                 del self.unacked[pdu.seq]
+                self.stats['DATA'][pdu.seq]['acked'] += 1
                 self.log.append(f"[t={self.now}] Sender: ACKed data[{pdu.seq}]")
 
         elif pdu.kind == 'NACK':
-            # fast retransmit if outstanding
+            # Even if we think it's already ACKed, honor the NACK to break deadlocks.
             if pdu.seq in self.unacked:
                 data_pdu, _, idx = self.unacked[pdu.seq]
-                self.log.append(f"[t={self.now}] Sender: NACK for data[{pdu.seq}] -> fast retransmit")
-                self.unacked[pdu.seq] = (data_pdu, self.now, idx)
-                r = self.channel.transmit(data_pdu, self.now, self.log)
-                if r: self.inflight.append((r[0], r[1], False))
-            # if it's already ACKed, ignore
+            else:
+                # Rebuild the DATA PDU if it exists in our original frame list
+                if pdu.seq is None or pdu.seq >= self.N:
+                    return
+                idx = None
+                for i in range(len(self.frames)):
+                    if i % self.N == pdu.seq:
+                        idx = i
+                        break
+                if idx is None or idx >= len(self.frames):
+                    return
+                data_pdu = build_pdu('DATA', pdu.seq, self.frames[idx])
+
+            self.log.append(f"[t={self.now}] Sender: NACK for data[{pdu.seq}] -> (re)transmit")
+            self.unacked[pdu.seq] = (data_pdu, self.now, idx)
+            self.stats['DATA'][pdu.seq]['retransmits'] += 1
+            self.stats['DATA'][pdu.seq]['sent'] += 1
+            r = self.channel.transmit(data_pdu, self.now, self.log)
+            if r: self.inflight.append((r[0], r[1], False))
 
     # ---------- termination ----------
     def done(self):
@@ -609,7 +337,40 @@ class SelectiveRepeatSimulator:
 
         finished = "YES" if self.done() else "NO"
         self.log.append(f"[t={self.now}] Simulation finished={finished}, delivered={len(self.delivered)}/{len(self.frames)}")
+
+        # Append compact summary tables
+        self.log.append("\n" + self._render_summary())
+
         return "\n".join(self.log), [p.decode(errors='ignore') for p in self.delivered], self.now
+
+    # ---------- summary rendering ----------
+    def _render_summary(self) -> str:
+        data_seqs = sorted(self.stats['DATA'].keys(), key=lambda s: (s is None, s))
+        lines = []
+        lines.append("==== SUMMARY: DATA (per sequence) ====")
+        lines.append(f"{'seq':>3} | {'sent':>4} {'reTX':>5} {'lost':>4} {'corr':>4} {'ACKed':>5} {'deliv':>5} {'TO':>3}")
+        lines.append("-"*45)
+        for s in data_seqs:
+            st = self.stats['DATA'][s]
+            lines.append(f"{s:>3} | {st['sent']:>4} {st['retransmits']:>5} {st['lost']:>4} {st['corrupted']:>4} {st['acked']:>5} {st['delivered']:>5} {st['timeouts']:>3}")
+
+        def agg(kind: str):
+            total = {'sent':0,'lost':0,'corrupted':0,'rx_ok_sender':0,'rx_ok_receiver':0}
+            for _seq, st in self.stats[kind].items():
+                for k in total:
+                    total[k] += st[k]
+            return total
+
+        ack_total = agg('ACK')
+        nack_total = agg('NACK')
+
+        lines.append("\n==== SUMMARY: CONTROL (totals) ====")
+        lines.append(f"{'kind':<6} | {'sent':>5} {'lost':>5} {'corr':>5} {'rx@sender':>9}")
+        lines.append("-"*40)
+        lines.append(f"{'ACK':<6} | {ack_total['sent']:>5} {ack_total['lost']:>5} {ack_total['corrupted']:>5} {ack_total['rx_ok_sender']:>9}")
+        lines.append(f"{'NACK':<6} | {nack_total['sent']:>5} {nack_total['lost']:>5} {nack_total['corrupted']:>5} {nack_total['rx_ok_sender']:>9}")
+
+        return "\n".join(lines)
 
 # ----------------------------
 # Example
@@ -626,11 +387,9 @@ if __name__ == "__main__":
         seed=9,
         rtt=4
     )
-    status_log, delivered_order, ticks = sim.run(max_ticks=1000)
+    status_log, delivered_order, ticks = sim.run(max_ticks=5000)
     print("---- STATUS LOG ----")
     print(status_log)
     print("\n---- DELIVERY ORDER ----")
     print(delivered_order)
     print(f"\nCompleted in {ticks} ticks, delivered {len(delivered_order)} frames.")
-
-##############################################################################################################################################################
